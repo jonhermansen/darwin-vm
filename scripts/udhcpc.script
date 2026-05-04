@@ -1,0 +1,21 @@
+#!/bin/sh
+# /etc/udhcpc.script — busybox udhcpc lease handler.
+
+case "$1" in
+  deconfig)
+    ip addr flush dev "$interface"
+    ip link set "$interface" up
+    ;;
+  bound|renew)
+    ip addr flush dev "$interface"
+    case "$subnet" in
+      255.255.0.0)   prefix=16 ;;
+      255.255.255.0) prefix=24 ;;
+      *)             prefix=24 ;;
+    esac
+    ip addr add "$ip/$prefix" dev "$interface"
+    [ -n "$router" ] && ip route replace default via "${router%% *}"
+    : > /etc/resolv.conf
+    for d in $dns; do echo "nameserver $d" >> /etc/resolv.conf; done
+    ;;
+esac

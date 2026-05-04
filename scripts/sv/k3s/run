@@ -1,0 +1,6 @@
+#!/bin/sh
+# k3s server (uses the nix snapshotter). Foreground: k3s server is
+# already a foreground daemon, so just exec it. runit will
+# restart on crash.
+exec 2>&1
+exec k3s server --snapshotter=nix

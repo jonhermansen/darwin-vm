@@ -1,4 +1,4 @@
-{ pkgs, pkgsCrossLinux, lib, root }:
+{ pkgs, pkgsCrossLinux, lib }:
 let
   isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
   isAarch64 = pkgs.stdenv.hostPlatform.isAarch64;
@@ -10,15 +10,21 @@ let
       machine = "virt";
       image = "arch/arm64/boot/Image";
       imageName = "Image";
-      console = "console=ttyAMA0 earlycon=pl011,0x9000000";
     } else {
       kernel = "x86_64";
       qemu = "x86_64";
       machine = "q35";
       image = "arch/x86/boot/bzImage";
       imageName = "bzImage";
-      console = "console=ttyS0 earlycon=uart8250,io,0x3f8";
     };
+
+  # Single kernel cmdline for both runners: virtio-console is the only
+  # console hardware vfkit emulates, and qemu can also wire it up. No
+  # earlycon (virtio-console has no earlycon driver) — early boot logs
+  # are still in the kernel ring buffer (dmesg) just not on the
+  # terminal. Add `earlycon=pl011,0x9000000` (arm) or
+  # `earlycon=uart8250,io,0x3f8` (x86) to debug pre-virtio init.
+  kernelCmdline = "console=hvc0 panic=-1";
 
   accel = if isDarwin then "hvf" else "kvm";
 
@@ -289,11 +295,26 @@ let
     CONFIG_RTC_CLASS=y
     CONFIG_RTC_HCTOSYS=y
 
-    # ---- 9p shared filesystem (host /nix into guest) ----------------------
+    # ---- Shared filesystem (host /nix into guest) -------------------------
+    # virtiofs is the lingua franca of our runner backends: qemu speaks
+    # it via virtiofsd, and vfkit only supports virtiofs. Standardizing
+    # on it keeps the guest-side mount identical regardless of which
+    # backend the host runs. 9p is kept as a fallback during the
+    # qemu-vs-vfkit runner work.
+    CONFIG_VIRTIO_FS=y
+    CONFIG_FUSE_FS=y
     CONFIG_NET_9P=y
     CONFIG_NET_9P_VIRTIO=y
     CONFIG_9P_FS=y
     CONFIG_9P_FS_POSIX_ACL=y
+
+    # ---- Persistent data disk (ext4 on /dev/vda → /var) -------------------
+    # Format-on-first-boot then mount at /var so containerd images,
+    # snapshots, k3s state, and logs survive reboots. ACLs + xattrs are
+    # required by containerd's overlay snapshotter.
+    CONFIG_EXT4_FS=y
+    CONFIG_EXT4_FS_POSIX_ACL=y
+    CONFIG_EXT4_FS_SECURITY=y
   '';
 
   kernelConfigArm64 = ''
@@ -329,18 +350,70 @@ let
     + (if isAarch64 then kernelConfigArm64 else kernelConfigX86)
   );
 
-  # Kernel src is the linux flake input — pure kernel tree, no nix/ or
-  # flake.nix to exclude (those live in this repo, not in linux).
-  kernelSrc = root;
+  # Kernel source — fetched as a tarball from the personal linux fork.
+  # We do NOT use a flake input for this: flake input materialization
+  # extracts to the case-insensitive nix store, and the kernel tree has
+  # ~12 case-pair files (xt_CONNMARK.h ↔ xt_connmark.h, etc.) that
+  # collapse onto a single inode, with non-deterministic content survival.
+  # Fetching the .tar.gz directly lets the build use `tar -xOf <exact
+  # case-name>` to overwrite case-folded paths with deterministic content
+  # (see prePatch in the kernel derivation below).
+  #
+  # Update `linuxRev` + `linuxHash` when you push new commits to the
+  # linux fork. lib.fakeHash on first build to discover the right hash.
+  linuxRev = "aa13ad0833fd4eaa8eecea64a310f7b16e1e28a8";
+  linuxHash = "sha256-Sjsd8KHjvsIbHyt/j1x+lHHLX8PKiBsWWuIHOF55Xw0=";
+
+  kernelSrc = pkgs.fetchurl {
+    url = "https://github.com/jonhermansen/linux/archive/${linuxRev}.tar.gz";
+    hash = linuxHash;
+  };
+
+  # Files where the kernel ships an uppercase shim alongside the lowercase
+  # peer that holds the actual struct/enum definitions. On case-insensitive
+  # FS only one inode survives extraction; we re-extract the lowercase
+  # entry by exact name from the tarball, redirecting to the lowercase
+  # path. That overwrites the case-folded inode's content with the full
+  # content (the lowercase peer's), so subsequent #includes resolve
+  # correctly regardless of which case-name won the initial race.
+  kernelCaseFoldFiles = [
+    "include/uapi/linux/netfilter/xt_connmark.h"
+    "include/uapi/linux/netfilter/xt_dscp.h"
+    "include/uapi/linux/netfilter/xt_mark.h"
+    "include/uapi/linux/netfilter/xt_rateest.h"
+    "include/uapi/linux/netfilter/xt_tcpmss.h"
+    "include/uapi/linux/netfilter_ipv4/ipt_ttl.h"
+    "include/uapi/linux/netfilter_ipv6/ip6t_hl.h"
+    "net/netfilter/xt_dscp.c"
+    "net/netfilter/xt_hl.c"
+    "net/netfilter/xt_rateest.c"
+    "net/netfilter/xt_tcpmss.c"
+  ];
 
   kernel = pkgs.stdenv.mkDerivation {
     pname = "linux";
-    version = "0.0.1";
+    version = "7.0.3";
 
     src = kernelSrc;
 
+    # vmlinux is an ELF, but it's a kernel image — no RPATH to shrink, no
+    # DT_NEEDED to rewrite. Skip the patchelf fixup hook (installed by the
+    # patchelf package via setup-hook.sh) to make intent explicit.
     dontPatchELF = true;
+    # Preserve vmlinux symbols for /System.map and kernel debugging.
     dontStrip = true;
+
+    # Case-fold collision fixup. After unpackPhase the source tree may
+    # have either case-name surviving for each pair, with arbitrary
+    # content. Re-extract the lowercase entry from the tarball directly
+    # (tar reads its index by exact case, not the FS), redirecting to
+    # the lowercase path. That overwrites the case-folded inode's
+    # content with the full definitions.
+    prePatch = ''
+      for f in ${lib.concatStringsSep " " kernelCaseFoldFiles} ; do
+        tar -xOzf $src "$sourceRoot/$f" > "$f"
+      done
+    '';
 
     nativeBuildInputs = [
       pkgs.gnumake
@@ -406,6 +479,7 @@ let
   socat = pkgsCrossLinux.socat;
   iptables = pkgsCrossLinux.iptables;
   dropbear = pkgsCrossLinux.dropbear;
+  e2fsprogs = pkgsCrossLinux.e2fsprogs;
   cacert = pkgsCrossLinux.cacert;
   # kubectl/crictl are embedded in the k3s binary — use multicall symlinks
   # rather than a separate cross-build (kubectl cross-from-darwin currently
@@ -413,6 +487,15 @@ let
   # exec one).
   k9s = pkgsCrossLinux.k9s;
   kubernetes-helm = pkgsCrossLinux.kubernetes-helm;
+  nano = pkgsCrossLinux.nano;
+  # Bundled images (pause, traefik, coredns, local-path, metrics-server)
+  # as a tar.zst k3s imports on startup. Avoids needing DNS + a working
+  # image-registry connection from the guest.
+  k3sAirgapImages = pkgsCrossLinux.k3s_1_36.airgap-images;
+  # terminfo database — TUI apps (k9s, vi, htop, less -R) read it via
+  # ncurses to learn what escape sequences a given $TERM accepts. Without
+  # a terminfo dir on PATH, tcell-based apps like k9s fail to initialize.
+  ncurses = pkgsCrossLinux.ncurses;
 
   # SSH pubkey baked into the VM so you can `ssh -p 2222 root@127.0.0.1`.
   sshAuthorizedKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC4vmj1CAkxctWi8CC/2Ox9TlvOJhwVGvGJTr7jPCuZR user@macbook.local";
@@ -506,9 +589,65 @@ let
     cc -O2 -Wall -Wextra -o $out/bin/host-info host-info.c
   '';
 
-  # Minimal initramfs: busybox + a shell script that mounts /nix from the
-  # host via 9p and drops to a shell.
+  # Bake @VAR@ placeholders → /nix/store paths in our shell scripts.
+  # `pkgs.replaceVars` (formerly `substituteAll`, removed 2025-05-23)
+  # produces a derivation whose output is the script with substitutions
+  # applied; it errors if a placeholder is unmatched or unused.
+  scriptInit = pkgs.replaceVars ./scripts/init {
+    nix = "${nix}";
+    iptables = "${iptables}";
+    k3s = "${k3s}";
+    strace = "${strace}";
+    socat = "${socat}";
+    k9s = "${k9s}";
+    nano = "${nano}";
+    kubernetes-helm = "${kubernetes-helm}";
+    cacert = "${cacert}";
+    ncurses = "${ncurses}";
+    dropbear = "${dropbear}";
+    e2fsprogs = "${e2fsprogs}";
+    sshAuthorizedKey = sshAuthorizedKey;
+    k3sAirgapImages = "${k3sAirgapImages}";
+  };
+  scriptUdhcpcLease = ./scripts/udhcpc.script;
+  scriptSvUdhcpc = ./scripts/sv/udhcpc/run;
+  scriptSvNixBridge = pkgs.replaceVars ./scripts/sv/nix-bridge/run {
+    daemonProxyPort = toString daemonProxyPort;
+  };
+  scriptSvDropbear = pkgs.replaceVars ./scripts/sv/dropbear/run {
+    dropbear = "${dropbear}";
+  };
+  scriptSvK3s = ./scripts/sv/k3s/run;
+  scriptSvK3sLog = ./scripts/sv/k3s/log/run;
+
+  # Minimal initramfs: busybox + /init + /etc/sv/<svc>/run runit
+  # service dirs + /etc/udhcpc.script DHCP lease handler.
   initramfs = pkgs.runCommand "initramfs.cpio.gz"
+    {
+      nativeBuildInputs = [ pkgs.cpio pkgs.gzip ];
+    } ''
+    ROOT=$(mktemp -d)
+    mkdir -p "$ROOT"/{bin,dev,proc,sys,nix,tmp,root,etc/sv/udhcpc,etc/sv/nix-bridge,etc/sv/dropbear,etc/sv/k3s/log}
+    cp ${busyboxStatic}/bin/busybox "$ROOT/bin/busybox"
+    chmod +x "$ROOT/bin/busybox"
+
+    install -m 0755 ${scriptInit}             "$ROOT/init"
+    install -m 0755 ${scriptUdhcpcLease}      "$ROOT/etc/udhcpc.script"
+    install -m 0755 ${scriptSvUdhcpc}         "$ROOT/etc/sv/udhcpc/run"
+    install -m 0755 ${scriptSvNixBridge}      "$ROOT/etc/sv/nix-bridge/run"
+    install -m 0755 ${scriptSvDropbear}       "$ROOT/etc/sv/dropbear/run"
+    install -m 0755 ${scriptSvK3s}            "$ROOT/etc/sv/k3s/run"
+    install -m 0755 ${scriptSvK3sLog}         "$ROOT/etc/sv/k3s/log/run"
+
+    (cd "$ROOT" && find . | cpio -H newc -o 2>/dev/null | gzip -9 > $out)
+  '';
+
+  # ============================================================
+  # OLD inline-init derivation, kept until the file-based version is
+  # validated to boot. Remove this whole heredoc once `nix run` works
+  # with the new initramfs.
+  # ============================================================
+  _initramfsLegacy = pkgs.runCommand "initramfs-legacy.cpio.gz"
     {
       nativeBuildInputs = [ pkgs.cpio pkgs.gzip ];
     } ''
@@ -552,7 +691,26 @@ let
     # iptables on PATH for kube-proxy.
     export PATH=${nix}/bin:${iptables}/bin:/bin:/sbin
     # Enable nix-command + flakes (k3s-side tooling tends to use the new CLI).
-    export NIX_CONFIG="experimental-features = nix-command flakes"
+    # Persist nix CLI config in the canonical location instead of env
+    # vars (SSH sessions and any spawned subprocess inherit it
+    # automatically; no need to re-export per-shell).
+    #   - experimental-features: enable nix-command + flakes
+    #   - store: point at the daemon socket bridged from the host. The
+    #     default path /nix/var/nix/daemon-socket/socket is unusable
+    #     because the entire /nix tree is mounted read-only from the
+    #     host (the 9p share is path=/nix), so we host the bridged
+    #     socket on a writable tmpfs at /run/ instead.
+    mkdir -p /etc/nix
+    cat > /etc/nix/nix.conf <<'NIX_CONF_EOF'
+    experimental-features = nix-command flakes
+    store = unix:///run/nix-daemon.sock
+    NIX_CONF_EOF
+    # TUI apps (k9s, vi, less -R) and busybox-sh job control both need a
+    # terminfo entry; the kernel console is closest to TERM=linux. SSH
+    # sessions get TERM from the client, so this only matters on the
+    # serial console. ncurses finds the terminfo db via the
+    # /etc/terminfo symlink (set up below) without needing TERMINFO_DIRS.
+    export TERM=linux
     mount -t proc none /proc
     mount -t sysfs none /sys
     # CONFIG_DEVTMPFS_MOUNT=y is suppressed under initramfs; mount manually
@@ -583,21 +741,51 @@ let
     # CA bundle so containerd / Go TLS clients can verify registry certs.
     mkdir -p /etc/ssl/certs
     ln -sf ${cacert}/etc/ssl/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt
-    if mount -t 9p -o trans=virtio,version=9p2000.L,ro nix-store /nix 2>/dev/null; then
-      echo "Mounted host /nix at /nix"
+    # terminfo at /etc/terminfo for tools that don't honor TERMINFO_DIRS.
+    ln -sf ${ncurses}/share/terminfo /etc/terminfo
+    # Try virtiofs first (vfkit, qemu+virtiofsd), then 9p (qemu on
+    # darwin where virtiofsd doesn't exist). Single tag "nix-store"
+    # works as both the virtiofs `tag=` and the 9p `mount_tag=`.
+    if mount -t virtiofs nix-store /nix 2>/dev/null; then
+      echo "Mounted host /nix at /nix (virtiofs)"
+    elif mount -t 9p -o trans=virtio,version=9p2000.L,ro nix-store /nix 2>/dev/null; then
+      echo "Mounted host /nix at /nix (9p)"
     else
       echo "WARN: failed to mount /nix from host"
     fi
 
-    # Networking — QEMU user-mode defaults (10.0.2.0/24)
-    echo "nameserver 10.0.2.3" > /etc/resolv.conf
+    # Networking — DHCP via busybox udhcpc. Both qemu user-mode and
+    # vfkit's vmnet provide a DHCP server, but the address ranges
+    # differ (qemu: 10.0.2.x, vfkit: vmnet-assigned 192.168.x.x), so
+    # static config doesn't work portably.
     ip link set lo up
-    if ip link set eth0 up 2>/dev/null && \
-       ip addr add 10.0.2.15/24 dev eth0 2>/dev/null && \
-       ip route add default via 10.0.2.2 2>/dev/null; then
-      echo "Network configured: eth0 = 10.0.2.15/24"
+    cat > /tmp/udhcpc.script <<'UDHCPC_EOF'
+    #!/bin/sh
+    case "$1" in
+      deconfig) ip addr flush dev "$interface"; ip link set "$interface" up ;;
+      bound|renew)
+        ip addr flush dev "$interface"
+        # Convert dotted subnet → prefix length (covers the /16 and /24
+        # cases qemu and vmnet both hand out; widen if you ever need it).
+        case "$subnet" in
+          255.255.0.0)   prefix=16 ;;
+          255.255.255.0) prefix=24 ;;
+          *)             prefix=24 ;;
+        esac
+        ip addr add "$ip/$prefix" dev "$interface"
+        [ -n "$router" ] && ip route replace default via "''${router%% *}"
+        : > /etc/resolv.conf
+        for d in $dns; do echo "nameserver $d" >> /etc/resolv.conf; done
+        ;;
+    esac
+    UDHCPC_EOF
+    chmod +x /tmp/udhcpc.script
+    if udhcpc -i eth0 -n -q -s /tmp/udhcpc.script 2>/dev/null; then
+      GW=$(ip route show default | awk '/default/{print $3; exit}')
+      MY_IP=$(ip -o -4 addr show eth0 | awk '{print $4; exit}')
+      echo "Network configured: eth0 = $MY_IP, gateway = $GW"
     else
-      echo "WARN: failed to configure eth0"
+      echo "WARN: DHCP failed on eth0"
     fi
 
     # Surface tools on PATH (binaries live in the host /nix mount).
@@ -611,15 +799,23 @@ let
     ln -sf ${k3s}/bin/crictl /bin/crictl
     ln -sf ${k3s}/bin/ctr /bin/ctr
     ln -sf ${k9s}/bin/k9s /bin/k9s
+    ln -sf ${nano}/bin/nano /bin/nano
     ln -sf ${kubernetes-helm}/bin/helm /bin/helm
 
-    # kubectl/k9s want $KUBECONFIG; k3s writes its kubeconfig here.
-    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    # kubectl's default search includes ~/.kube/config; symlink the file
+    # k3s writes there once it's available, so KUBECONFIG doesn't need
+    # to be in the env (SSH sessions inherit nothing → would otherwise
+    # need to re-export there too).
+    mkdir -p /root/.kube
+    ln -sf /etc/rancher/k3s/k3s.yaml /root/.kube/config
 
     # Bridge nix-daemon socket from host: guest UNIX socket ⇆ host TCP.
+    # Path is referenced from /etc/nix/nix.conf above; lives on /run
+    # (tmpfs) since /nix is the read-only host mount. The host IP is
+    # whatever the DHCP server advertised as gateway — qemu user-mode
+    # uses 10.0.2.2, vfkit's vmnet uses the vmnet-assigned NAT gateway.
     socat UNIX-LISTEN:/run/nix-daemon.sock,fork,unlink-early \
-          TCP:10.0.2.2:${daemonProxyPort} 2>/dev/null &
-    export NIX_REMOTE=unix:///run/nix-daemon.sock
+          "TCP:''${GW:-10.0.2.2}:${daemonProxyPort}" 2>/dev/null &
 
     # SSH server (dropbear): regenerate host key per boot, install the
     # baked-in pubkey, listen on :22 (host port ${sshHostPort} → :22).
@@ -643,40 +839,83 @@ let
     k3s server --snapshotter=nix </dev/null >/var/log/k3s.log 2>&1 &
     echo $! > /run/k3s.pid
 
-    exec /bin/sh
+    # Capture all post-boot kernel messages to /var/log/kernel.log so the
+    # console stays clean for interactive shells and TUI apps. /dev/kmsg
+    # is the in-kernel stream of every printk; `cat` follows it
+    # indefinitely. (busybox's dmesg lacks -w/--follow, so we read the
+    # underlying device directly.) Pre-boot messages already went to the
+    # console as usual.
+    mkdir -p /var/log
+    (cat /dev/kmsg > /var/log/kernel.log 2>&1) &
+
+    # Drop the runtime console-loglevel to KERN_ALERT-and-worse only, so
+    # bridge/veth/iptables printks don't paint over k9s/vi/htop output on
+    # the serial console. View captured logs with `tail -f /var/log/kernel.log`
+    # or `dmesg` (ring buffer); raise verbosity again with `dmesg -n 7`.
+    dmesg -n 1 2>/dev/null || true
+
+    # `setsid -c` creates a new session AND makes our stdin (the kernel
+    # console) the new session's controlling TTY. Without this, the shell
+    # has no controlling terminal: open("/dev/tty") fails with ENXIO,
+    # job control (^Z, fg, bg) is silently disabled, and TUI apps like
+    # k9s/vi/htop can't take over the screen.
+    exec setsid -c /bin/sh
     INIT_EOF
     chmod +x "$ROOT/init"
     chmod +x "$ROOT/init"
     (cd "$ROOT" && find . | cpio -H newc -o 2>/dev/null | gzip -9 > $out)
   '';
 
+  # Common pre-launch logic for any runner: VM resource sizing,
+  # persistent disk-image setup, and nix-daemon socket bridging.
+  # Emitted as a shell snippet that runners source at the top of their text.
+  preLaunch = ''
+    # Default to half the host's CPUs and RAM, detected by a tiny C helper
+    # that's portable across macOS / Linux / FreeBSD. Override with
+    # VM_CPUS / VM_MEM_MB env vars.
+    HOST_CPUS=$(${hostInfo}/bin/host-info cpus)
+    HOST_MEM_MB=$(${hostInfo}/bin/host-info memory-mb)
+    VM_CPUS="''${VM_CPUS:-$((HOST_CPUS / 2))}"
+    VM_MEM_MB="''${VM_MEM_MB:-$((HOST_MEM_MB / 2))}"
+    [ "$VM_CPUS"   -lt 2    ] && VM_CPUS=2
+    [ "$VM_MEM_MB" -lt 4096 ] && VM_MEM_MB=4096
+
+    # Persistent raw disk image (sparse, 100G). vfkit can't read qcow2,
+    # so raw is the only format that works across both runners. truncate
+    # creates a sparse file: the on-disk allocation grows only as the
+    # guest writes blocks.
+    VM_STATE_DIR="''${XDG_DATA_HOME:-$HOME/.local/share}/darwin-vm"
+    VM_DISK="''${VM_DISK:-$VM_STATE_DIR/disk.img}"
+    VM_DISK_SIZE="''${VM_DISK_SIZE:-100G}"
+    mkdir -p "$(dirname "$VM_DISK")"
+    if [ ! -f "$VM_DISK" ]; then
+      truncate -s "$VM_DISK_SIZE" "$VM_DISK"
+      echo "Created sparse disk image: $VM_DISK ($VM_DISK_SIZE)"
+    fi
+
+    # Bridge host nix-daemon socket onto a TCP port the guest can reach
+    # via the runner's user-mode networking (host appears as 10.0.2.2 to
+    # qemu user-mode; vfkit's NAT differs — see below).
+    DAEMON_SOCK="''${NIX_DAEMON_SOCKET:-/nix/var/nix/daemon-socket/socket}"
+    if [ -S "$DAEMON_SOCK" ]; then
+      socat TCP-LISTEN:${daemonProxyPort},bind=127.0.0.1,reuseaddr,fork \
+            "UNIX-CONNECT:$DAEMON_SOCK" 2>/dev/null &
+      SOCAT_PID=$!
+      trap 'kill $SOCAT_PID 2>/dev/null || true' EXIT
+    else
+      echo "warning: no nix-daemon socket at $DAEMON_SOCK; guest daemon proxy disabled" >&2
+    fi
+
+    echo "VM: $VM_CPUS CPUs, ''${VM_MEM_MB} MB RAM, disk $VM_DISK"
+  '';
+
+  # qemu runner — works on every supported host. Uses 9p for the /nix
+  # share (virtiofsd is Linux-only; 9p works under qemu everywhere).
   run = pkgs.writeShellApplication {
     name = "run-kernel";
     runtimeInputs = [ pkgs.qemu pkgs.socat ];
-    text = ''
-      # Default to half the host's CPUs and RAM, detected by a tiny C helper
-      # that's portable across macOS / Linux / FreeBSD. Override with
-      # VM_CPUS / VM_MEM_MB env vars.
-      HOST_CPUS=$(${hostInfo}/bin/host-info cpus)
-      HOST_MEM_MB=$(${hostInfo}/bin/host-info memory-mb)
-      VM_CPUS="''${VM_CPUS:-$((HOST_CPUS / 2))}"
-      VM_MEM_MB="''${VM_MEM_MB:-$((HOST_MEM_MB / 2))}"
-      [ "$VM_CPUS"   -lt 2    ] && VM_CPUS=2
-      [ "$VM_MEM_MB" -lt 4096 ] && VM_MEM_MB=4096
-
-      # Bridge host nix-daemon socket onto a TCP port the guest can reach
-      # via QEMU's user-mode networking (host appears as 10.0.2.2).
-      DAEMON_SOCK="''${NIX_DAEMON_SOCKET:-/nix/var/nix/daemon-socket/socket}"
-      if [ -S "$DAEMON_SOCK" ]; then
-        socat TCP-LISTEN:${daemonProxyPort},bind=127.0.0.1,reuseaddr,fork \
-              "UNIX-CONNECT:$DAEMON_SOCK" 2>/dev/null &
-        SOCAT_PID=$!
-        trap 'kill $SOCAT_PID 2>/dev/null || true' EXIT
-      else
-        echo "warning: no nix-daemon socket at $DAEMON_SOCK; guest daemon proxy disabled" >&2
-      fi
-
-      echo "VM: $VM_CPUS CPUs, ''${VM_MEM_MB} MB RAM"
+    text = preLaunch + ''
+      echo "Runner: qemu (share transport: 9p)"
 
       qemu-system-${arch.qemu} \
         -machine ${arch.machine} \
@@ -691,11 +930,49 @@ let
         -initrd ${initramfs} \
         -fsdev local,id=nixstore_fsdev,path=/nix,security_model=none,readonly=on \
         -device virtio-9p-pci,fsdev=nixstore_fsdev,mount_tag=nix-store \
+        -drive file="$VM_DISK",format=raw,if=virtio,cache=writeback,discard=unmap \
         -netdev user,id=net0,hostfwd=tcp:127.0.0.1:${sshHostPort}-:22 \
         -device virtio-net-pci,netdev=net0 \
-        -append "${arch.console} panic=-1" \
+        -append "${kernelCmdline}" \
+        "$@"
+    '';
+  };
+
+  # vfkit runner — Apple Virtualization Framework, darwin only. Uses
+  # virtiofs for the /nix share (vfkit's only supported share type).
+  # Networking is NAT-only with auto-assigned IP: there's no qemu-style
+  # hostfwd, so SSH after boot is `ssh root@<guest-ip>` rather than
+  # `ssh -p 2222 root@127.0.0.1`. The guest IP is announced on stdout
+  # by vfkit's DHCP lease.
+  run-vfkit = pkgs.writeShellApplication {
+    name = "run-kernel-vfkit";
+    runtimeInputs = [ pkgs.vfkit pkgs.socat ];
+    text = preLaunch + ''
+      echo "Runner: vfkit (share transport: virtiofs)"
+
+      # Forward ^C (and ^Z, ^\) as bytes to the guest tty instead of
+      # letting the host tty translate them into SIGINT for vfkit
+      # itself (which would kill the VM). qemu's -nographic mux handles
+      # this internally; vfkit doesn't, so we do it from the runner.
+      # Restored on EXIT so the host shell isn't left in raw mode.
+      saved_stty=$(stty -g 2>/dev/null || true)
+      [ -n "$saved_stty" ] && trap 'stty "$saved_stty" 2>/dev/null || true; kill ''${SOCAT_PID:-0} 2>/dev/null || true' EXIT
+      stty -isig -icanon -echo 2>/dev/null || true
+
+      # vfkit doesn't emulate qemu's PL011/8250 UARTs — its console is
+      # virtio-console (hvc0). CONFIG_VIRTIO_CONSOLE=y in the kernel
+      # provides the device; the cmdline tells kernel to log there.
+      vfkit \
+        --cpus "$VM_CPUS" \
+        --memory "$VM_MEM_MB" \
+        --bootloader "linux,kernel=${kernel}/${arch.imageName},initrd=${initramfs},cmdline=\"console=hvc0 panic=-1\"" \
+        --device virtio-rng \
+        --device "virtio-fs,sharedDir=/nix,mountTag=nix-store" \
+        --device "virtio-blk,path=$VM_DISK" \
+        --device "virtio-net,nat,mac=72:20:43:d4:38:62" \
+        --device virtio-serial,stdio \
         "$@"
     '';
   };
 in
-{ inherit kernel initramfs run; }
+{ inherit kernel initramfs run run-vfkit; }

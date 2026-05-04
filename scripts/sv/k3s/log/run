@@ -1,0 +1,5 @@
+#!/bin/sh
+# Capture k3s stdout+stderr (piped here by runsv) into a timestamped
+# rotating log under /var/log/k3s/current. Old logs roll to
+# @<timestamp>.s automatically.
+exec svlogd -tt /var/log/k3s

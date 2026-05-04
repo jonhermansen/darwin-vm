@@ -4,15 +4,14 @@
   inputs = {
     nixpkgs.url = "github:jonhermansen/nixpkgs/jon/darwin";
 
-    # Kernel source as a non-flake input — we only need the tree, the build
-    # recipe lives here.
-    linux = {
-      url = "github:jonhermansen/linux/jon/darwin";
-      flake = false;
-    };
+    # Kernel source is fetched as a tarball directly inside nix/default.nix
+    # (so the build can re-extract specific entries by exact case to
+    # neutralize APFS case-fold races). It is *not* declared as a flake
+    # input — flake input materialization extracts to the case-insensitive
+    # store, which is exactly the race we're trying to avoid.
   };
 
-  outputs = { self, nixpkgs, linux }:
+  outputs = { self, nixpkgs }:
     let
       systems = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
@@ -31,27 +30,49 @@
             };
           };
         in
-        import ./nix {
+        import ./default.nix {
           inherit pkgs pkgsCrossLinux;
           lib = nixpkgs.lib;
-          # Path into the kernel tree fetched as the `linux` flake input.
-          root = linux;
         };
     in
     {
       packages = forAllSystems (s:
-        let p = perSystem s; in {
-          default = p.run;
+        let
+          p = perSystem s;
+          # vfkit is darwin-only and uses Apple's Virtualization Framework,
+          # which can virtualize aarch64 on aarch64 hosts and x86_64 on
+          # x86_64 hosts (no emulation). On Linux hosts, use qemu.
+          preferredRunner =
+            if nixpkgs.lib.hasSuffix "-darwin" s then p.run-vfkit else p.run;
+        in {
+          default = preferredRunner;
           kernel = p.kernel;
           initramfs = p.initramfs;
           run = p.run;
+          run-vfkit = p.run-vfkit;
         });
 
       apps = forAllSystems (s:
-        let p = perSystem s; in {
+        let
+          p = perSystem s;
+          preferredRunner =
+            if nixpkgs.lib.hasSuffix "-darwin" s then p.run-vfkit else p.run;
+          preferredBin =
+            if nixpkgs.lib.hasSuffix "-darwin" s
+            then "${p.run-vfkit}/bin/run-kernel-vfkit"
+            else "${p.run}/bin/run-kernel";
+        in {
           default = {
             type = "app";
+            program = preferredBin;
+          };
+          run = {
+            type = "app";
             program = "${p.run}/bin/run-kernel";
+          };
+          run-vfkit = {
+            type = "app";
+            program = "${p.run-vfkit}/bin/run-kernel-vfkit";
           };
         });
     };

@@ -1,0 +1,150 @@
+#!/bin/busybox sh
+# /init — boot fundamentals: filesystems, /etc/* config, /nix mount,
+# tool symlinks, dropbear host key. Service startup is delegated to
+# busybox runit (runsvdir scanning /etc/sv/) at the bottom.
+
+/bin/busybox --install -s /bin
+
+# If we're still on the initial ramfs (kubelet/cAdvisor can't introspect
+# 'rootfs' / 'ramfs' filesystem types), pivot to a tmpfs root and re-exec
+# this same script from there. Subsequent invocations skip this block
+# because /proc/mounts shows / as tmpfs.
+mkdir -p /proc /sysroot
+mount -t proc none /proc 2>/dev/null || true
+ROOTFS_TYPE=$(awk '$2 == "/" {print $3; exit}' /proc/mounts 2>/dev/null)
+umount /proc 2>/dev/null || true
+if [ "$ROOTFS_TYPE" = "rootfs" ] || [ "$ROOTFS_TYPE" = "ramfs" ]; then
+  echo "Pivoting from initramfs ($ROOTFS_TYPE) to tmpfs root"
+  mount -t tmpfs -o size=4G,mode=755 tmpfs /sysroot
+  for d in bin dev etc nix proc root run sys tmp var; do
+    mkdir -p "/sysroot/$d"
+  done
+  cp /bin/busybox /sysroot/bin/busybox
+  cp /init /sysroot/init
+  # Carry the entire /etc tree (contains /etc/sv runit service dirs and
+  # /etc/udhcpc.script lease handler) over to the tmpfs root.
+  cp -a /etc/. /sysroot/etc/
+  chmod +x /sysroot/init
+  exec switch_root /sysroot /init
+fi
+
+# Env (most config now lives in /etc/* so SSH sessions inherit it too).
+export HOME=/root
+export TZ=UTC
+export PATH=@nix@/bin:@iptables@/bin:/bin:/sbin
+export TERM=linux
+# `sv` looks under $SVDIR (default /var/service) regardless of where
+# runsvdir is scanning. Point it at our service dir so `sv status k3s`
+# (and up/down/restart) work without absolute paths.
+export SVDIR=/etc/sv
+
+# Mount filesystems.
+mount -t proc none /proc
+mount -t sysfs none /sys
+# CONFIG_DEVTMPFS_MOUNT=y is suppressed under initramfs; mount manually.
+mount -t devtmpfs none /dev
+mkdir -p /dev/pts && mount -t devpts none /dev/pts
+mkdir -p /sys/fs/cgroup && mount -t cgroup2 none /sys/fs/cgroup
+mkdir -p /run && mount -t ramfs none /run
+
+# /etc/* config files.
+mkdir -p /etc /root
+echo 'root:x:0:0:root:/root:/bin/sh' > /etc/passwd
+echo 'root:x:0:' > /etc/group
+hostname k3s-vm
+echo k3s-vm > /etc/hostname
+echo "00000000000000000000000000000000" > /etc/machine-id
+cat > /etc/hosts <<HOSTS_EOF
+127.0.0.1   localhost
+::1         localhost ip6-localhost ip6-loopback
+HOSTS_EOF
+
+mkdir -p /etc/ssl/certs
+ln -sf @cacert@/etc/ssl/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt
+ln -sf @ncurses@/share/terminfo /etc/terminfo
+
+mkdir -p /etc/nix
+cat > /etc/nix/nix.conf <<NIX_CONF_EOF
+experimental-features = nix-command flakes
+store = unix:///run/nix-daemon.sock
+NIX_CONF_EOF
+
+# Try virtiofs first (vfkit, qemu+virtiofsd), then 9p (qemu on darwin
+# where virtiofsd doesn't exist). Single tag "nix-store" works as both
+# the virtiofs `tag=` and the 9p `mount_tag=`.
+if mount -t virtiofs nix-store /nix 2>/dev/null; then
+  echo "Mounted host /nix at /nix (virtiofs)"
+elif mount -t 9p -o trans=virtio,version=9p2000.L,ro nix-store /nix 2>/dev/null; then
+  echo "Mounted host /nix at /nix (9p)"
+else
+  echo "WARN: failed to mount /nix from host"
+fi
+
+# Persistent data disk: virtio-blk shows up as /dev/vda. Try mounting
+# first; if that fails the disk is unformatted (first boot), so format
+# ext4 and remount. The VM is otherwise stateless, so an unformatted
+# disk is a reliable "first boot" signal — no separate marker needed.
+# Everything stateful (containerd images & snapshots, k3s state, logs)
+# lives under /var so it persists.
+if [ -b /dev/vda ]; then
+  if ! mount -t ext4 /dev/vda /var 2>/dev/null; then
+    echo "Formatting /dev/vda as ext4 (first boot)"
+    @e2fsprogs@/bin/mkfs.ext4 -q -L vmdata /dev/vda
+    mount -t ext4 /dev/vda /var || echo "WARN: failed to mount /dev/vda on /var"
+  fi
+  echo "Mounted /dev/vda on /var ($(df -h /var | awk 'NR==2{print $2" total, "$4" free"}'))"
+else
+  echo "WARN: no /dev/vda; /var is on tmpfs (non-persistent)"
+fi
+mkdir -p /var/log
+
+# Tool symlinks (binaries live in the host /nix mount).
+ln -sf @k3s@/bin/k3s          /bin/k3s
+ln -sf @strace@/bin/strace    /bin/strace
+ln -sf @nix@/bin/nix          /bin/nix
+ln -sf @socat@/bin/socat      /bin/socat
+ln -sf @k3s@/bin/kubectl      /bin/kubectl
+ln -sf @k3s@/bin/crictl       /bin/crictl
+ln -sf @k3s@/bin/ctr          /bin/ctr
+ln -sf @k9s@/bin/k9s          /bin/k9s
+ln -sf @nano@/bin/nano        /bin/nano
+ln -sf @kubernetes-helm@/bin/helm /bin/helm
+
+# kubectl's default config search.
+mkdir -p /root/.kube
+ln -sf /etc/rancher/k3s/k3s.yaml /root/.kube/config
+
+# SSH key + dropbear host key (one-shot generation per boot).
+mkdir -p /etc/dropbear /root/.ssh
+echo '@sshAuthorizedKey@' > /root/.ssh/authorized_keys
+chmod 700 /root/.ssh
+chmod 600 /root/.ssh/authorized_keys
+@dropbear@/bin/dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null
+
+# Bring loopback up — runit-managed udhcpc handles eth0.
+ip link set lo up
+
+# k3s scans this dir on startup and imports each *.tar/*.tar.gz/*.tar.zst
+# into containerd's local store, so the bundled images (pause, coredns,
+# traefik, local-path, metrics-server) don't have to be pulled from a
+# remote registry. Pods that need outbound connectivity at runtime
+# still need DNS to work — this just removes the registry dependency
+# for the boot-critical images.
+mkdir -p /var/lib/rancher/k3s/agent/images
+ln -sf @k3sAirgapImages@ /var/lib/rancher/k3s/agent/images/airgap.tar.zst
+
+# Capture all post-boot kernel messages to /var/log/kernel.log.
+(cat /dev/kmsg > /var/log/kernel.log 2>&1) &
+
+# Drop console-loglevel so TUIs (k9s, vi) aren't repainted by printks.
+dmesg -n 1 2>/dev/null || true
+
+# Run services. runsvdir spawns one runsv per /etc/sv/<svc>/ subdir,
+# auto-restarts on crash, exposes `sv up/down/restart <svc>` for
+# control. Both stdout and stderr go to a logfile so service output
+# doesn't paint over the interactive shell. Per-service log/run scripts
+# (e.g. /etc/sv/k3s/log/run) capture individual service output.
+runsvdir /etc/sv >>/var/log/runsvdir.log 2>&1 &
+
+# Drop to interactive shell with controlling tty (job control + /dev/tty).
+exec setsid -c /bin/sh

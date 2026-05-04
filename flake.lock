@@ -1,0 +1,27 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1777819907,
+        "narHash": "sha256-Qp9XEaM9YY6TPYWgAEfZu6F1MUWB7lhO009oHluqvd0=",
+        "owner": "jonhermansen",
+        "repo": "nixpkgs",
+        "rev": "a4d232b8b39cdd460aaeb6395f7a0e4ac9b2072e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jonhermansen",
+        "ref": "jon/darwin",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

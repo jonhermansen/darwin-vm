@@ -1,0 +1,13 @@
+#!/bin/sh
+# Bring the first non-loopback interface up and run busybox udhcpc in
+# foreground. Renewals are handled by udhcpc's lease loop; runit
+# restarts us if the daemon dies.
+exec 2>&1
+IFACE=$(ip -o link show | awk -F': ' '$2 != "lo" {print $2; exit}')
+if [ -z "$IFACE" ]; then
+  echo "udhcpc: no non-loopback interface found"
+  sleep 5
+  exit 1
+fi
+ip link set "$IFACE" up
+exec udhcpc -i "$IFACE" -f -S -s /etc/udhcpc.script

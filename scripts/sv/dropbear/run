@@ -1,0 +1,4 @@
+#!/bin/sh
+# SSH server. -F = foreground (required for runit), -E = log to stderr.
+exec 2>&1
+exec @dropbear@/bin/dropbear -F -E -r /etc/dropbear/dropbear_ed25519_host_key

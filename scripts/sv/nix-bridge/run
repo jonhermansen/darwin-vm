@@ -1,0 +1,14 @@
+#!/bin/sh
+# Bridge the nix-daemon socket from the host: guest UNIX socket ⇆ host
+# TCP. The host IP is the DHCP-discovered gateway (qemu user-mode:
+# 10.0.2.2; vfkit: vmnet-assigned 192.168.x.1). Until DHCP installs a
+# default route, exit non-zero and let runit retry with backoff.
+exec 2>&1
+GW=$(ip route show default | awk '/default/{print $3; exit}')
+if [ -z "$GW" ]; then
+  echo "nix-bridge: no default route yet (waiting for udhcpc)"
+  sleep 2
+  exit 1
+fi
+exec socat UNIX-LISTEN:/run/nix-daemon.sock,fork,unlink-early \
+           "TCP:$GW:@daemonProxyPort@"
