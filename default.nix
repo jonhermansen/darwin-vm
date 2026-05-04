@@ -898,7 +898,7 @@ let
     # qemu user-mode; vfkit's NAT differs — see below).
     DAEMON_SOCK="''${NIX_DAEMON_SOCKET:-/nix/var/nix/daemon-socket/socket}"
     if [ -S "$DAEMON_SOCK" ]; then
-      socat TCP-LISTEN:${daemonProxyPort},bind=127.0.0.1,reuseaddr,fork \
+      socat TCP-LISTEN:${daemonProxyPort},bind=0.0.0.0,reuseaddr,fork \
             "UNIX-CONNECT:$DAEMON_SOCK" 2>/dev/null &
       SOCAT_PID=$!
       trap 'kill $SOCAT_PID 2>/dev/null || true' EXIT
