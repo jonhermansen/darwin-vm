@@ -974,5 +974,9 @@ let
         "$@"
     '';
   };
+  nativeBuild = import ./native-build.nix {
+    inherit pkgs kernel busyboxStatic lib;
+  };
+
 in
-{ inherit kernel initramfs run run-vfkit; }
+{ inherit kernel initramfs run run-vfkit; inherit (nativeBuild) runInLinuxVM buildNatively; }

@@ -50,6 +50,15 @@
           initramfs = p.initramfs;
           run = p.run;
           run-vfkit = p.run-vfkit;
+          test-native-build = p.runInLinuxVM {
+            name = "test-native-build";
+            script = ''
+              uname -a > $out/uname.txt
+              echo "Hello from native Linux VM build!" > $out/hello.txt
+            '';
+          };
+          test-build-natively = p.buildNatively
+            nixpkgs.legacyPackages.aarch64-linux.hello;
         });
 
       apps = forAllSystems (s:
