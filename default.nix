@@ -69,6 +69,9 @@ let
     CONFIG_MULTIUSER=y
     CONFIG_BINFMT_ELF=y
     CONFIG_BINFMT_SCRIPT=y
+    # Cross-arch user binaries via qemu-user / Rosetta (userspace registers
+    # the interpreter at boot via /proc/sys/fs/binfmt_misc/register).
+    CONFIG_BINFMT_MISC=y
     # The userspace-API syscalls below are all `default y if EXPERT` —
     # tinyconfig flips them off because allnoconfig sets EXPERT. Modern
     # userspace (Go runtime, container runtimes, libuv, glibc) requires
@@ -83,7 +86,7 @@ let
     CONFIG_DEVTMPFS=y
     CONFIG_DEVTMPFS_MOUNT=y
     CONFIG_PROC_FS=y
-    CONFIG_PROC_SYSCTL=y
+    CONFIG_SYSCTL=y
     CONFIG_SYSFS=y
     # tmpfs (and its xattr support) — needed to switch_root off the initial
     # ramfs into a real filesystem that supports xattrs (containerd overlay
@@ -361,8 +364,8 @@ let
   #
   # Update `linuxRev` + `linuxHash` when you push new commits to the
   # linux fork. lib.fakeHash on first build to discover the right hash.
-  linuxRev = "aa13ad0833fd4eaa8eecea64a310f7b16e1e28a8";
-  linuxHash = "sha256-Sjsd8KHjvsIbHyt/j1x+lHHLX8PKiBsWWuIHOF55Xw0=";
+  linuxRev = "b4f4cc07985411fb223dc1bc683029d71aadc0ad"; # v7.3.0
+  linuxHash = "sha256-rDtBLRM/8FHu7F6sOSRDmmt6YMX10dEVXtxQZFM3D+A=";
 
   kernelSrc = pkgs.fetchurl {
     url = "https://github.com/jonhermansen/linux/archive/${linuxRev}.tar.gz";
@@ -392,7 +395,7 @@ let
 
   kernel = pkgs.stdenv.mkDerivation {
     pname = "linux";
-    version = "7.0.3";
+    version = "7.3.0";
 
     src = kernelSrc;
 
