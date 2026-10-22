@@ -9,26 +9,35 @@
 # TCG (software emulation) so no hypervisor entitlements are needed
 # inside the nix build sandbox.
 
-{ pkgs, kernel, busyboxStatic, lib }:
+{
+  pkgs,
+  kernel,
+  busyboxStatic,
+  lib,
+}:
 
 let
   isAarch64 = pkgs.stdenv.hostPlatform.isAarch64;
 
   arch =
-    if isAarch64 then {
-      qemu = "aarch64";
-      machine = "virt";
-      imageName = "Image";
-    } else {
-      qemu = "x86_64";
-      machine = "q35";
-      imageName = "bzImage";
-    };
+    if isAarch64 then
+      {
+        qemu = "aarch64";
+        machine = "virt";
+        imageName = "Image";
+      }
+    else
+      {
+        qemu = "x86_64";
+        machine = "q35";
+        imageName = "bzImage";
+      };
 
   initScript = pkgs.writeText "init-native-build" ''
     #!/bin/busybox sh
     /bin/busybox --install -s /bin
 
+    set -x
     mount -t proc none /proc
     mount -t sysfs none /sys
     mount -t devtmpfs none /dev
@@ -40,6 +49,9 @@ let
 
     mount -t 9p -o trans=virtio,version=9p2000.L,ro nix-store /nix/store
     mount -t 9p -o trans=virtio,version=9p2000.L,rw,cache=none share /share
+    # Fast, case-sensitive scratch space for in-VM extraction/build.
+    mkdir -p /build
+    mount -t tmpfs -o size=12G,mode=755 tmpfs /build
 
     export HOME=/root
     export TZ=UTC
@@ -59,29 +71,39 @@ let
       echo 1 > /share/exit-code
     fi
 
+    echo "=== /share/build.log ==="
+    cat /share/build.log
+    echo "=== end ==="
+
     sync
     poweroff -f
   '';
 
-  buildInitramfs = pkgs.runCommand "build-initramfs.cpio.gz" {
-    nativeBuildInputs = [ pkgs.cpio pkgs.gzip ];
-  } ''
-    ROOT=$(mktemp -d)
-    mkdir -p "$ROOT"/{bin,dev,proc,sys,nix/store,share,tmp,etc,root}
-    cp ${busyboxStatic}/bin/busybox "$ROOT/bin/busybox"
-    chmod +x "$ROOT/bin/busybox"
-    install -m 0755 ${initScript} "$ROOT/init"
-    (cd "$ROOT" && find . | cpio -H newc -o 2>/dev/null | gzip -9 > $out)
-  '';
+  buildInitramfs =
+    pkgs.runCommand "build-initramfs.cpio.gz"
+      {
+        nativeBuildInputs = [
+          pkgs.cpio
+          pkgs.gzip
+        ];
+      }
+      ''
+        ROOT=$(mktemp -d)
+        mkdir -p "$ROOT"/{bin,dev,proc,sys,nix/store,share,tmp,etc,root}
+        cp ${busyboxStatic}/bin/busybox "$ROOT/bin/busybox"
+        chmod +x "$ROOT/bin/busybox"
+        install -m 0755 ${initScript} "$ROOT/init"
+        (cd "$ROOT" && find . | cpio -H newc -o 2>/dev/null | gzip -9 > $out)
+      '';
 
   # Shared QEMU invocation for both interfaces
   qemuCmd = ''
     qemu-system-${arch.qemu} \
       -machine ${arch.machine} \
-      -cpu max \
-      -accel tcg \
-      -smp 2 \
-      -m 2048 \
+      -cpu host \
+      -accel hvf \
+      -smp 4 \
+      -m 8192 \
       -nographic \
       -no-reboot \
       -kernel ${kernel}/${arch.imageName} \
@@ -90,7 +112,7 @@ let
       -device virtio-9p-pci,fsdev=nixstore,mount_tag=nix-store \
       -fsdev local,id=share,path="$SHARE",security_model=none \
       -device virtio-9p-pci,fsdev=share,mount_tag=share \
-      -append "console=hvc0 panic=-1"
+      -append "${if isAarch64 then "console=ttyAMA0" else "console=ttyS0"} panic=-1"
   '';
 
   checkResult = ''
@@ -108,13 +130,15 @@ let
     fi
   '';
 
-in {
+in
+{
   # Run a raw shell script inside a Linux VM.
-  runInLinuxVM = { name, script }:
+  runInLinuxVM =
+    { name, script }:
     let
       buildScript = pkgs.writeScript "${name}-build.sh" ''
         #!/bin/sh
-        set -e
+        set -ex
         ${script}
       '';
     in
@@ -122,22 +146,33 @@ in {
       inherit name;
       system = pkgs.stdenv.hostPlatform.system;
       builder = "${pkgs.bash}/bin/bash";
-      args = [ "-e" (pkgs.writeText "${name}-wrapper.sh" ''
-        export PATH="${lib.makeBinPath [ pkgs.qemu pkgs.coreutils ]}:$PATH"
+      args = [
+        "-e"
+        (pkgs.writeText "${name}-wrapper.sh" ''
+          export PATH="${
+            lib.makeBinPath [
+              pkgs.qemu
+              pkgs.coreutils
+            ]
+          }:$PATH"
 
-        SHARE="$TMPDIR/vm-share"
-        mkdir -p "$SHARE/out"
+          SHARE="$TMPDIR/vm-share"
+          mkdir -p "$SHARE/out"
 
-        cp ${buildScript} "$SHARE/build.sh"
+          cp ${buildScript} "$SHARE/build.sh"
 
-        ${qemuCmd}
-        ${checkResult}
+          ${qemuCmd}
+          ${checkResult}
 
-        mv "$SHARE/out" "$out"
-      '') ];
+          mv "$SHARE/out" "$out"
+        '')
+      ];
 
       __recursive = true;
-      requiredSystemFeatures = [ "recursive-nix" ];
+      requiredSystemFeatures = [
+        "recursive-nix"
+        "apple-virt"
+      ];
     };
 
   # Build a nixpkgs derivation natively inside a Linux VM.
@@ -154,7 +189,8 @@ in {
   #
   # Usage:
   #   buildNatively pkgsLinux.hello
-  buildNatively = target:
+  buildNatively =
+    target:
     let
       # Depend on the .drv file itself, not on building its outputs.
       targetDrv = builtins.unsafeDiscardOutputDependency target.drvPath;
@@ -163,69 +199,80 @@ in {
       name = "native-${target.name or "build"}";
       system = pkgs.stdenv.hostPlatform.system;
       builder = "${pkgs.bash}/bin/bash";
-      args = [ "-e" (pkgs.writeText "build-natively-${target.name or "build"}.sh" ''
-        export PATH="${lib.makeBinPath [
-          pkgs.qemu pkgs.coreutils pkgs.jq pkgs.nix
-        ]}:$PATH"
+      args = [
+        "-e"
+        (pkgs.writeText "build-natively-${target.name or "build"}.sh" ''
+          export PATH="${
+            lib.makeBinPath [
+              pkgs.qemu
+              pkgs.coreutils
+              pkgs.jq
+              pkgs.nix
+            ]
+          }:$PATH"
 
-        SHARE="$TMPDIR/vm-share"
-        mkdir -p "$SHARE/out"
+          SHARE="$TMPDIR/vm-share"
+          mkdir -p "$SHARE/out"
 
-        TARGET_DRV="${targetDrv}"
+          TARGET_DRV="${targetDrv}"
 
-        echo "=== buildNatively: $TARGET_DRV ==="
+          echo "=== buildNatively: $TARGET_DRV ==="
 
-        NIX="nix --extra-experimental-features nix-command"
+          NIX="nix --extra-experimental-features nix-command"
 
-        if ! DRV_JSON=$($NIX derivation show "$TARGET_DRV" 2>&1); then
-          echo "nix derivation show failed: $DRV_JSON" >&2
-          exit 1
-        fi
+          if ! DRV_JSON=$($NIX derivation show "$TARGET_DRV" 2>&1); then
+            echo "nix derivation show failed: $DRV_JSON" >&2
+            exit 1
+          fi
 
-        # Fetch all input derivation outputs from the binary cache
-        echo "Fetching build inputs..."
-        for drv in $(echo "$DRV_JSON" | jq -r 'to_entries[0].value.inputDrvs | keys[]'); do
-          echo "  realising $drv"
-          nix-store --realise "$drv" 2>&1 | tail -1 || true
-        done
+          # Fetch all input derivation outputs from the binary cache
+          echo "Fetching build inputs..."
+          for drv in $(echo "$DRV_JSON" | jq -r 'to_entries[0].value.inputDrvs | keys[]'); do
+            echo "  realising $drv"
+            nix-store --realise "$drv" 2>&1 | tail -1 || true
+          done
 
-        # Also ensure input sources are present
-        for src in $(echo "$DRV_JSON" | jq -r 'to_entries[0].value.inputSrcs[]'); do
-          echo "  source: $src"
-        done
+          # Also ensure input sources are present
+          for src in $(echo "$DRV_JSON" | jq -r 'to_entries[0].value.inputSrcs[]'); do
+            echo "  source: $src"
+          done
 
-        # Generate the build script from the derivation
-        {
-          echo '#!/bin/sh'
-          echo 'set -e'
-          echo 'export out=/share/out'
+          # Generate the build script from the derivation
+          {
+            echo '#!/bin/sh'
+            echo 'set -e'
+            echo 'export out=/share/out'
 
-          # Set all env vars from the derivation (except out, which we override)
-          echo "$DRV_JSON" | jq -r '
-            to_entries[0].value.env | to_entries[] |
-            select(.key != "out") |
-            "export " + .key + "=" + (.value | @sh)
-          '
+            # Set all env vars from the derivation (except out, which we override)
+            echo "$DRV_JSON" | jq -r '
+              to_entries[0].value.env | to_entries[] |
+              select(.key != "out") |
+              "export " + .key + "=" + (.value | @sh)
+            '
 
-          # Invoke the builder with its args
-          BUILDER=$(echo "$DRV_JSON" | jq -r 'to_entries[0].value.builder')
-          ARGS=$(echo "$DRV_JSON" | jq -r 'to_entries[0].value.args | map(@sh) | join(" ")')
-          echo "exec $BUILDER $ARGS"
-        } > "$SHARE/build.sh"
-        chmod +x "$SHARE/build.sh"
+            # Invoke the builder with its args
+            BUILDER=$(echo "$DRV_JSON" | jq -r 'to_entries[0].value.builder')
+            ARGS=$(echo "$DRV_JSON" | jq -r 'to_entries[0].value.args | map(@sh) | join(" ")')
+            echo "exec $BUILDER $ARGS"
+          } > "$SHARE/build.sh"
+          chmod +x "$SHARE/build.sh"
 
-        echo "=== Booting Linux VM ==="
+          echo "=== Booting Linux VM ==="
 
-        ${qemuCmd}
+          ${qemuCmd}
 
-        echo "=== VM exited ==="
+          echo "=== VM exited ==="
 
-        ${checkResult}
+          ${checkResult}
 
-        mv "$SHARE/out" "$out"
-      '') ];
+          mv "$SHARE/out" "$out"
+        '')
+      ];
 
       __recursive = true;
-      requiredSystemFeatures = [ "recursive-nix" ];
+      requiredSystemFeatures = [
+        "recursive-nix"
+        "apple-virt"
+      ];
     };
 }
