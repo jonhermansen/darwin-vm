@@ -364,8 +364,8 @@ let
   #
   # Update `linuxRev` + `linuxHash` when you push new commits to the
   # linux fork. lib.fakeHash on first build to discover the right hash.
-  linuxRev = "b4f4cc07985411fb223dc1bc683029d71aadc0ad"; # v7.3.0
-  linuxHash = "sha256-rDtBLRM/8FHu7F6sOSRDmmt6YMX10dEVXtxQZFM3D+A=";
+  linuxRev = "a06f223ef1d5053c1a2307f9c89ced9c9bfdf38d"; # v7.3.1
+  linuxHash = "sha256-93A+kHKi25BfbNBfL6GLa9bqGNt5beP9Zv36xr5y0wg=";
 
   kernelSrc = pkgs.fetchurl {
     url = "https://github.com/jonhermansen/linux/archive/${linuxRev}.tar.gz";
@@ -395,7 +395,7 @@ let
 
   kernel = pkgs.stdenv.mkDerivation {
     pname = "linux";
-    version = "7.3.0";
+    version = "7.3.1";
 
     src = kernelSrc;
 
