@@ -19,6 +19,7 @@
       perSystem = system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          hostCpu = pkgs.stdenv.hostPlatform.parsed.cpu.name;
           # Cross-built Linux package set — same CPU as the host, Linux
           # kernel, glibc. Works for any CPU nixpkgs supports without
           # enumeration. We use this for *all* Linux-targeted derivations
@@ -26,13 +27,88 @@
           pkgsCrossLinux = import nixpkgs {
             inherit system;
             crossSystem = {
-              config = "${pkgs.stdenv.hostPlatform.parsed.cpu.name}-unknown-linux-gnu";
+              config = "${hostCpu}-unknown-linux-gnu";
             };
           };
+          hostTarget = import ./default.nix {
+            inherit pkgs pkgsCrossLinux;
+            lib = nixpkgs.lib;
+          };
+          # Target-specific view of default.nix for a given CPU (gives us
+          # that target's kernelSrc, kernelConfigFragment, linuxRev).
+          targetView = cpu: import ./default.nix {
+            inherit pkgs pkgsCrossLinux;
+            lib = nixpkgs.lib;
+            targetCpu = cpu;
+          };
+          pkgsLinux = nixpkgs.legacyPackages."${hostCpu}-linux";
+          isDarwin = nixpkgs.lib.hasSuffix "-darwin" system;
+          # Build a kernel for `cpu`:
+          #   - cpu == hostCpu: direct build (hostTarget.kernel already).
+          #   - cpu != hostCpu && darwin host: pure cross hits darwin
+          #     host-tool portability holes (vdso2c <endian.h>, Mach-O/ELF
+          #     linker confusion). Route through recursive-nix: boot the
+          #     host-arch Linux VM under HVF, build the cross kernel inside
+          #     where host tools see real Linux headers.
+          #   - cpu != hostCpu && linux host: LLVM=1 cross directly works.
+          kernelForCpu = cpu:
+            if cpu == hostCpu then hostTarget.kernel
+            else if !isDarwin then (targetView cpu).kernel
+            else let
+              tv = targetView cpu;
+              tools = with pkgsLinux; [
+                gnumake flex bison bc
+                llvmPackages.clang-unwrapped llvm lld
+                openssl perl python3 gcc
+                coreutils gnutar gzip xz gawk findutils gnused
+                pahole
+              ];
+              toolsPath = nixpkgs.lib.concatStringsSep ":"
+                (map (p: "${p}/bin") tools);
+              elfutils = pkgsLinux.elfutils;
+              archMap = { x86_64 = "x86_64"; aarch64 = "arm64"; };
+              imageMap = {
+                x86_64 = "arch/x86/boot/bzImage";
+                aarch64 = "arch/arm64/boot/Image";
+              };
+              imageNameMap = { x86_64 = "bzImage"; aarch64 = "Image"; };
+            in hostTarget.runInLinuxVM {
+              name = "linux-${tv.linuxRev}-${cpu}";
+              script = ''
+                mkdir -p $out
+                export PATH=${toolsPath}:/bin
+                export C_INCLUDE_PATH=${elfutils.dev}/include
+                export LIBRARY_PATH=${elfutils.out}/lib
+                cd /build
+                tar -xzf ${tv.kernelSrc}
+                cd linux-${tv.linuxRev}
+                MAKE_FLAGS="ARCH=${archMap.${cpu}} LLVM=1 HOSTCC=gcc HOSTLD=ld"
+                make $MAKE_FLAGS tinyconfig
+                ./scripts/kconfig/merge_config.sh -m .config ${tv.kernelConfigFragment}
+                make $MAKE_FLAGS olddefconfig
+                cp .config $out/config
+                # Fail loud on silently-dropped CONFIG_*=y requests.
+                awk -F= '/^CONFIG_[A-Z0-9_]+=y$/{print $1"=y"}' ${tv.kernelConfigFragment} \
+                  | sort -u > /tmp/wanted
+                awk -F= '/^CONFIG_[A-Z0-9_]+=y$/{print $1"=y"}' .config \
+                  | sort -u > /tmp/got
+                missing=$(comm -23 /tmp/wanted /tmp/got)
+                if [ -n "$missing" ]; then
+                  echo "ERROR: dropped by olddefconfig:" >&2
+                  echo "$missing" >&2
+                  exit 1
+                fi
+                make $MAKE_FLAGS -j"$(nproc)" ${imageNameMap.${cpu}}
+                cp ${imageMap.${cpu}} $out/${imageNameMap.${cpu}}
+                cp vmlinux $out/vmlinux
+              '';
+            };
         in
-        import ./default.nix {
-          inherit pkgs pkgsCrossLinux;
-          lib = nixpkgs.lib;
+        hostTarget // {
+          kernel = hostTarget.kernel // {
+            aarch64 = kernelForCpu "aarch64";
+            x86_64 = kernelForCpu "x86_64";
+          };
         };
     in
     {

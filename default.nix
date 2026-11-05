@@ -1,7 +1,9 @@
-{ pkgs, pkgsCrossLinux, lib }:
+{ pkgs, pkgsCrossLinux, lib
+, targetCpu ? pkgs.stdenv.hostPlatform.parsed.cpu.name
+}:
 let
   isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
-  isAarch64 = pkgs.stdenv.hostPlatform.isAarch64;
+  isAarch64 = targetCpu == "aarch64";
 
   arch =
     if isAarch64 then {
@@ -104,11 +106,13 @@ let
     CONFIG_PACKET=y
     CONFIG_UNIX=y
 
+    # ---- SMP --------------------------------------------------------------
+    # arm64 defconfig turns SMP on; x86 tinyconfig doesn't. CPUSETS and
+    # several scheduler cgroup features depend on SMP, so set it here.
+    CONFIG_SMP=y
+
     # ---- PCI bus ----------------------------------------------------------
     CONFIG_PCI=y
-    # Generic ECAM PCI host bridge (used by arm64 QEMU virt; harmless on x86)
-    CONFIG_PCI_HOST_GENERIC=y
-    CONFIG_PCI_ECAM=y
     # MSI is a hard dep of VIRTIO_PCI; without it VIRTIO_PCI is silently
     # dropped and virtio-pci devices never bind.
     CONFIG_PCI_MSI=y
@@ -333,6 +337,10 @@ let
     # GICv2 fallback (some QEMU machine configs) and its MSI bridge.
     CONFIG_ARM_GIC=y
     CONFIG_ARM_GIC_V2M=y
+    # Generic ECAM PCI host bridge: arm64 QEMU virt uses this; depends on OF
+    # (device tree) which x86 doesn't have, so it's arm64-only.
+    CONFIG_PCI_HOST_GENERIC=y
+    CONFIG_PCI_ECAM=y
   '';
 
   kernelConfigX86 = ''
@@ -982,4 +990,10 @@ let
   };
 
 in
-{ inherit kernel initramfs run run-vfkit; inherit (nativeBuild) runInLinuxVM buildNatively; }
+{
+  inherit kernel initramfs run run-vfkit;
+  inherit (nativeBuild) runInLinuxVM buildNatively;
+  # Exposed so the flake can wire cross-arch kernel builds through
+  # recursive-nix without re-deriving them.
+  inherit kernelSrc kernelConfigFragment linuxRev targetCpu;
+}
