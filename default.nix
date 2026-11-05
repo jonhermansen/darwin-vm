@@ -918,6 +918,12 @@ let
     fi
 
     echo "VM: $VM_CPUS CPUs, ''${VM_MEM_MB} MB RAM, disk $VM_DISK"
+
+    # Allow downstream to boot a custom initramfs (any .cpio.gz nix built).
+    # Default: the k3s-flavored initramfs bundled with this flake. The guest
+    # /nix store is virtiofs-passthrough, so the custom path is instantly
+    # available inside the VM.
+    VM_INITRAMFS="''${VM_INITRAMFS:-${initramfs}}"
   '';
 
   # qemu runner — works on every supported host. Uses 9p for the /nix
@@ -938,7 +944,7 @@ let
         -no-reboot \
         -rtc base=utc,clock=host \
         -kernel ${kernel}/${arch.imageName} \
-        -initrd ${initramfs} \
+        -initrd "$VM_INITRAMFS" \
         -fsdev local,id=nixstore_fsdev,path=/nix,security_model=none,readonly=on \
         -device virtio-9p-pci,fsdev=nixstore_fsdev,mount_tag=nix-store \
         -drive file="$VM_DISK",format=raw,if=virtio,cache=writeback,discard=unmap \
@@ -976,7 +982,7 @@ let
       vfkit \
         --cpus "$VM_CPUS" \
         --memory "$VM_MEM_MB" \
-        --bootloader "linux,kernel=${kernel}/${arch.imageName},initrd=${initramfs},cmdline=\"console=hvc0 panic=-1\"" \
+        --bootloader "linux,kernel=${kernel}/${arch.imageName},initrd=$VM_INITRAMFS,cmdline=\"console=hvc0 panic=-1\"" \
         --device virtio-rng \
         --device "virtio-fs,sharedDir=/nix,mountTag=nix-store" \
         --device "virtio-blk,path=$VM_DISK" \
